@@ -2,7 +2,6 @@ package com.penyo.tsington.v0;
 
 import com.penyo.tsington.config.PerformanceConfig;
 
-import java.io.Closeable;
 import java.time.Instant;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -16,7 +15,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * @author Penyo
  */
-public class PressureMonitor implements Closeable {
+public class PressureMonitor implements AutoCloseable {
   /**
    * 请求记录
    */

@@ -4,9 +4,7 @@ import com.penyo.tsington.config.PerformanceConfig;
 import com.penyo.tsington.config.UserConfig;
 import com.penyo.tsington.util.DriverProxy;
 
-import java.io.Closeable;
 import java.sql.Connection;
-import java.sql.SQLException;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
 
@@ -16,7 +14,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * <p>
  * 连接池是一种对 {@link java.sql.Connection Connection} 池化技术的体现。其生命周期分为<b>初始期、
  * 伺服期和终结期</b>三个阶段。实例化池时，其立刻进入初始期，期间池拒绝响应；当驱动和连接集合就绪后，
- * 进入伺服期，此时池可以向外提供有关 {@link com.penyo.tsington.v0.ConnectionShell ConnectionShell}
+ * 进入伺服期，此时池可以向外提供有关 {@link TrackableConnection TrackableConnection}
  * 的服务；手动调用池的 {@code shutdown()} 方法后，池进入终结期，其内的连接会被全部销毁，即不再可用。
  * </p>
  *
@@ -39,30 +37,30 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *
  * @author Penyo
  */
-public abstract class TsingtonDataSource implements TsingtonDataSourceSpecification, Closeable {
+public abstract class TsingtonDataSource implements TsingtonDataSourceSpecification {
   /**
    * 用户配置
    */
-  private UserConfig uc;
+  private UserConfig userConfig;
   /**
    * 性能配置
    */
-  private PerformanceConfig pc;
+  private PerformanceConfig performanceConfig;
 
   @Override
   public UserConfig getUserConfig() {
-    return uc;
+    return userConfig;
   }
 
   @Override
   public PerformanceConfig getPerformanceConfig() {
-    return pc;
+    return performanceConfig;
   }
 
   /**
    * 压力监视器
    */
-  private PressureMonitor pm;
+  private PressureMonitor pressureMonitor;
 
   protected TsingtonDataSource() {
   }
@@ -79,30 +77,30 @@ public abstract class TsingtonDataSource implements TsingtonDataSourceSpecificat
     if (uc == null || pc == null || isAlive) throw new RuntimeException();
 
     DriverProxy.register(uc.driver());
-    this.uc = uc;
-    this.pc = pc;
+    this.userConfig = uc;
+    this.performanceConfig = pc;
     isAlive = true;
     expand(pc.getMinConnectionsNum());
-    pm = new PressureMonitor(this);
+    pressureMonitor = new PressureMonitor(this);
   }
 
   /**
    * 空闲队列
    */
-  private final Queue<ConnectionShell> remainings = new ConcurrentLinkedQueue<>();
+  private final Queue<TrackableConnection> idles = new ConcurrentLinkedQueue<>();
   /**
    * 忙碌队列
    */
-  private final Queue<ConnectionShell> workings = new ConcurrentLinkedQueue<>();
+  private final Queue<TrackableConnection> workings = new ConcurrentLinkedQueue<>();
 
   @Override
   public int getRemainingCapacity() {
-    return remainings.size();
+    return idles.size();
   }
 
   @Override
   public int getCapacity() {
-    return remainings.size() + workings.size();
+    return idles.size() + workings.size();
   }
 
   /**
@@ -111,11 +109,11 @@ public abstract class TsingtonDataSource implements TsingtonDataSourceSpecificat
   protected void expand(int amount) {
     if (!isAlive) throw new RuntimeException();
 
-    if (getRemainingCapacity() + amount <= pc.getMaxConnectionsNum()) for (int i = 0; i < amount; i++)
+    if (getRemainingCapacity() + amount <= performanceConfig.getMaxConnectionsNum()) for (int i = 0; i < amount; i++)
       try {
-        Connection c = DriverProxy.getConnection(uc);
-        if (c == null) throw new RuntimeException("Cannot login!");
-        remainings.add(new ConnectionShell(c));
+        Connection c = DriverProxy.getConnection(userConfig);
+        if (c == null) throw new RuntimeException("Cannot login to SQL server.");
+        idles.add(new TrackableConnection(c, this));
       } catch (Exception ignored) {
       }
   }
@@ -126,48 +124,47 @@ public abstract class TsingtonDataSource implements TsingtonDataSourceSpecificat
   protected void contract(int amount) {
     if (!isAlive) throw new RuntimeException();
 
-    if (getRemainingCapacity() - amount >= pc.getMinConnectionsNum()) for (int i = 0; i < amount; i++) {
-      try {
-        ConnectionShell cs = remainings.poll();
-        if (cs != null) cs.getUsufruct().close();
-      } catch (SQLException ignored) {
-      }
+    if (getRemainingCapacity() - amount >= performanceConfig.getMinConnectionsNum()) for (int i = 0; i < amount; i++) {
+      TrackableConnection cs = idles.poll();
+      if (cs != null) cs.tradeOff();
     }
   }
 
   @Override
-  public synchronized ConnectionShell lendShell() {
+  public synchronized Connection getConnection() {
     if (!isAlive) throw new RuntimeException();
 
-    pm.request();
+    pressureMonitor.request();
 
-    ConnectionShell cs = null;
+    TrackableConnection tc = null;
 
     long requestTime = System.currentTimeMillis();
-    while (System.currentTimeMillis() - requestTime < pc.getRequestTimeout()) {
-      if (remainings.isEmpty()) try {
+    while (System.currentTimeMillis() - requestTime < performanceConfig.getRequestTimeout()) {
+      if (idles.isEmpty()) try {
         wait(100);
       } catch (InterruptedException ignored) {
       }
       else {
-        cs = remainings.poll();
-        cs.enable();
-        workings.offer(cs);
+        tc = idles.poll();
+        workings.offer(tc);
         break;
       }
     }
 
-    return cs;
+    if (tc != null)
+      return tc.proxy();
+    return null;
   }
 
-  @Override
-  public synchronized void returnShell(ConnectionShell cs) {
+  /**
+   * 归还连接。
+   */
+  protected synchronized void returnConnection(TrackableConnection cs) {
     if (!isAlive) throw new RuntimeException();
 
     if (workings.contains(cs)) {
       workings.remove(cs);
-      cs.disable();
-      remainings.offer(cs);
+      idles.offer(new TrackableConnection(cs.getRealConnection(), this));
     }
   }
 
@@ -175,19 +172,18 @@ public abstract class TsingtonDataSource implements TsingtonDataSourceSpecificat
   public void close() {
     if (!isAlive) throw new RuntimeException();
 
-    for (ConnectionShell cs : workings)
+    for (TrackableConnection cs : workings)
       try {
-        returnShell(cs);
-        cs.getUsufruct().close();
+        cs.close();
       } catch (Exception ignored) {
       }
-    for (ConnectionShell cs : remainings)
+    for (TrackableConnection cs : idles)
       try {
-        cs.getUsufruct().close();
+        cs.tradeOff();
       } catch (Exception ignored) {
       }
 
-    pm.close();
+    pressureMonitor.close();
     isAlive = false;
   }
 }

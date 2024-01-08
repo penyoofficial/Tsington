@@ -3,10 +3,12 @@ package com.penyo.tsington.v0;
 import com.penyo.tsington.config.PerformanceConfig;
 import com.penyo.tsington.config.UserConfig;
 
+import java.sql.Connection;
+
 /**
  * 青彤™ 连接池规范
  */
-public interface TsingtonDataSourceSpecification {
+public interface TsingtonDataSourceSpecification extends AutoCloseable {
   /**
    * 获取用户配置。
    */
@@ -54,12 +56,7 @@ public interface TsingtonDataSourceSpecification {
   }
 
   /**
-   * 借用连接壳。
+   * 借用连接。
    */
-  ConnectionShell lendShell();
-
-  /**
-   * 归还连接壳。
-   */
-  void returnShell(ConnectionShell cs);
+  Connection getConnection();
 }
